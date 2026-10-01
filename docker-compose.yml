@@ -1,14 +1,61 @@
 services:
-  app:
-    build: .
-    image: ${COMPOSE_PROJECT_NAME:-day-surgery}-app
-    ports:
-      # 仅把应用服务发布到宿主；容器内部固定 8080（非 root nginx）
-      - "${CC_PUBLISH_PORT:-3001}:8080"
-    restart: unless-stopped
+  db:
+    image: mariadb:11
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpass
+      MARIADB_DATABASE: ${DB_NAME:-followup}
+      MARIADB_USER: ${DB_USER:-ccdev}
+      MARIADB_PASSWORD: ${DB_PASSWORD:-ccdev}
+    volumes:
+      - db_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
-      interval: 30s
-      timeout: 3s
-      start_period: 5s
-      retries: 3
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    environment:
+      APP_DATABASE_URL: mysql+pymysql://${DB_USER:-ccdev}:${DB_PASSWORD:-ccdev}@db:3306/${DB_NAME:-followup}?charset=utf8mb4
+      APP_SECRET_KEY: ${APP_SECRET_KEY:-please-change-this-secret}
+      APP_UPLOAD_DIR: /data/uploads
+      APP_AUTO_SCHEMA: "1"
+      APP_AUTO_SEED: "1"
+      APP_RUN_BACKGROUND: "1"
+      WAIT_DB_HOST: db
+      WAIT_DB_PORT: "3306"
+    volumes:
+      - upload_data:/data/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 15s
+      timeout: 4s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 构建期仅用于类型检查/打包，前端运行时走同源 /api
+        VITE_API_BASE: /api
+    ports:
+      - "${CC_PUBLISH_PORT:-3001}:8080"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  db_data:
+  upload_data:

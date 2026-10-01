@@ -1,9 +1,9 @@
 {
-  "name": "day-surgery-handover",
+  "name": "post-discharge-followup",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "医院日间手术患者陪诊交接与术后接送平台",
+  "description": "出院后分级随访与高风险升级处置平台",
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --noEmit",
@@ -12,8 +12,7 @@
   },
   "dependencies": {
     "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "zustand": "^4.5.5"
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@types/react": "^18.3.3",

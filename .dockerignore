@@ -7,3 +7,10 @@ dist
 Dockerfile
 docker-compose.yml
 README.md
+
+# Python 后端本地虚拟环境与缓存（不进入前端构建上下文）
+backend/.venv
+backend/**/__pycache__
+**/__pycache__
+.pytest_cache
+*.db
