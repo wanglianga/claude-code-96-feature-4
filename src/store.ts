@@ -1,346 +1,314 @@
-import { create } from 'zustand'
-import type {
-  DischargeChecklist,
-  ExceptionType,
-  FollowupTask,
-  Handover,
-  Patient,
-  PatientStatus,
-  Person,
-  PreopAssessment,
-  ProlongedReason,
-  SessionUser,
-  TimelineEvent,
-} from './types'
-import { ACCOUNTS, BASE_NOW, seedPatients, uid } from './data'
-import { EX_META, STATUS_META, feeSettled, isProlonged } from './utils'
+import { create } from 'zustand';
+import type { BaseEvent, User, Role, PatientAggregate } from './types';
+import {
+  SystemState, DomainError, project,
+  submitReport, nurseScreen, resolveReferral, doctorAddOrder, withdrawOrder,
+  pharmacistAdvice, resolveManualQueue, closeCase, declineContact,
+  tickSla, retryNotification,
+} from './engine';
+import type { ReportInput, ScreenDecision, AddOrderInput } from './engine';
+import { buildSeedState, SEED_USERS } from './seed';
+import { uid } from './rules';
 
-interface StoreState {
-  now: number
-  user: SessionUser | null
-  patients: Patient[]
-  followups: FollowupTask[]
+const STORAGE_KEY = 'followup-system-state-v1';
+const SESSION_KEY = 'followup-system-session-v1';
+const CLOCK_KEY = 'followup-system-clock-v1';
 
-  login: (account: string, password: string) => string | null
-  logout: () => void
-  tick: (minutes: number) => void
-
-  checkIn: (patientId: string) => void
-  saveAssessment: (patientId: string, a: Omit<PreopAssessment, 'by' | 'at'>) => void
-  confirmHandover: (patientId: string, h: Omit<Handover, 'confirmedAt'>) => string | null
-  advance: (patientId: string) => string | null
-
-  markBpAbnormal: (patientId: string, detail: string) => void
-  delaySurgery: (patientId: string, minutes: number, reason: string) => void
-  changeAnesthesia: (patientId: string, next: string, reason: string) => void
-  escortLeave: (patientId: string) => void
-  changePickup: (patientId: string, person: Person) => void
-  resolveException: (patientId: string, exId: string) => void
-
-  settlePayment: (patientId: string, amount: number) => void
-  setProlongedReason: (patientId: string, reason: ProlongedReason, note: string) => void
-  saveDischarge: (patientId: string, d: Omit<DischargeChecklist, 'by' | 'at'>) => string | null
-  signPickup: (patientId: string, signer: string, phone: string) => string | null
-  completeFollowup: (id: string) => void
+interface PersistShape {
+  patients: SystemState['patients'];
+  events: BaseEvent[];
+  notifyChannelDown: boolean;
 }
 
-const STATUS_PUBLIC: Partial<Record<PatientStatus, string>> = {
-  registered: '您已完成到院签到，请等待护士术前评估。',
-  waiting: '术前评估已完成，请耐心候诊。',
-  in_or: '患者已进入手术区。',
-  in_surgery: '手术已开始。',
-  recovery: '手术已结束，患者正在复苏观察中。',
-  ready_pickup: '患者已可离院，等待接送人签收。',
-  discharged: '患者已离院，请遵医嘱休养并按时复诊。',
+function loadState(): { state: SystemState; clockOffsetMin: number } {
+  let clockOffsetMin = 0;
+  try {
+    clockOffsetMin = Number(localStorage.getItem(CLOCK_KEY) ?? '0') || 0;
+  } catch { /* ignore */ }
+
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const data = JSON.parse(raw) as PersistShape;
+      return {
+        state: { patients: data.patients, users: SEED_USERS, events: data.events, notifyChannelDown: data.notifyChannelDown },
+        clockOffsetMin,
+      };
+    }
+  } catch { /* ignore */ }
+  const state = buildSeedState(new Date());
+  return { state, clockOffsetMin };
 }
 
-function makeEvent(
-  now: number,
-  actor: string,
-  kind: TimelineEvent['kind'],
-  text: string,
-  publicText?: string,
-): TimelineEvent {
-  return { id: uid(), at: now, actor, kind, text, publicText }
+let initial: { state: SystemState; clockOffsetMin: number } | null = null;
+
+export interface Toast {
+  id: string;
+  kind: 'ok' | 'error' | 'info';
+  text: string;
 }
 
-/** 生成异常回访任务（离院签收时调用） */
-function buildFollowups(p: Patient, now: number): FollowupTask[] {
-  const tasks: FollowupTask[] = []
-  const mk = (reason: string): FollowupTask => ({
-    id: uid('f'),
-    patientId: p.id,
-    patientName: p.name,
-    reason,
-    createdAt: now,
-    done: false,
-  })
-  tasks.push(mk('术后 24 小时常规回访'))
-  if (p.discharge && p.discharge.painScore >= 4) tasks.push(mk(`异常回访：离院疼痛评分 ${p.discharge.painScore} 分（≥4）`))
-  if (p.recovery?.prolongedReason) tasks.push(mk(`异常回访：复苏滞留（${p.recovery.prolongedReason}）`))
-  if (p.exceptions.some((e) => !e.resolved)) tasks.push(mk('异常回访：住院期间存在未闭环异常事件'))
-  return tasks
+interface Store {
+  state: SystemState;
+  currentUser: User | null;
+  clockOffsetMin: number;
+  toasts: Toast[];
+  activePatientId: string;
+
+  now: () => Date;
+  login: (loginName: string, password: string) => boolean;
+  logout: () => void;
+  setActivePatient: (id: string) => void;
+
+  aggregates: () => { patient: PatientAggregate; patientId: string }[];
+  aggregate: (id: string) => PatientAggregate;
+
+  pushToast: (kind: Toast['kind'], text: string) => void;
+  dismissToast: (id: string) => void;
+
+  run: <T>(fn: () => T, okMsg?: string) => T | undefined;
+  persist: () => void;
+  resetDemo: () => void;
+
+  setClockOffset: (min: number) => void;
+  advanceClock: (min: number) => void;
+  setChannelDown: (down: boolean) => void;
+
+  doSubmitReport: (patientId: string, input: ReportInput) => ReturnType<typeof submitReport> | undefined;
+  doDeclineContact: (patientId: string, reason: string) => void;
+  doNurseScreen: (patientId: string, taskId: string, decision: ScreenDecision, expectedVersion: number) => void;
+  doResolveReferral: (patientId: string, referralId: string, action: 'confirmed' | 'rejected', note: string) => void;
+  doAddOrder: (patientId: string, input: AddOrderInput) => ReturnType<typeof doctorAddOrder> | undefined;
+  doWithdrawOrder: (patientId: string, orderId: string, reason: string) => void;
+  doPharmacyAdvice: (patientId: string, input: { taskId?: string; interaction: string; advice: string; severity: 'info' | 'warning' | 'critical' }) => void;
+  doResolveQueue: (patientId: string, taskId: string, note: string) => void;
+  doClose: (patientId: string, taskId: string, basis: string, expectedVersion: number) => void;
+  doRetryNotification: (eventId: string) => void;
+  doTickSla: () => number;
+  lastReportCommandByPatient: Record<string, string>;
+  doReplayLastReport: (patientId: string) => void;
 }
 
-export const useStore = create<StoreState>((set, get) => {
-  /** 更新单个患者，可附带追加的回访任务 */
-  const update = (id: string, fn: (p: Patient) => Patient, extraFollowups: FollowupTask[] = []) =>
-    set((s) => ({
-      patients: s.patients.map((p) => (p.id === id ? fn(p) : p)),
-      followups: extraFollowups.length ? [...s.followups, ...extraFollowups] : s.followups,
-    }))
+export const useStore = create<Store>((set, get) => {
+  if (!initial) initial = loadState();
+  const persistNow = (state: SystemState, clockOffsetMin: number) => {
+    try {
+      const data: PersistShape = {
+        patients: state.patients, events: state.events,
+        notifyChannelDown: state.notifyChannelDown,
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      localStorage.setItem(CLOCK_KEY, String(clockOffsetMin));
+    } catch { /* ignore */ }
+  };
 
-  const actor = () => {
-    const u = get().user
-    return u ? `${u.title}·${u.name}` : '系统'
-  }
-
-  const transit = (p: Patient, to: PatientStatus, now: number, by: string, text?: string): Patient => ({
-    ...p,
-    status: to,
-    statusAt: { ...p.statusAt, [to]: now },
-    timeline: [
-      ...p.timeline,
-      makeEvent(now, by, 'status', text ?? `状态变更：${STATUS_META[to].label}`, STATUS_PUBLIC[to]),
-    ],
-  })
+  let sessionUser: User | null = null;
+  try {
+    const sid = localStorage.getItem(SESSION_KEY);
+    sessionUser = sid ? SEED_USERS.find((u) => u.id === sid) ?? null : null;
+  } catch { /* ignore */ }
 
   return {
-    now: BASE_NOW,
-    user: null,
-    patients: seedPatients(),
-    followups: [
-      { id: uid('f'), patientId: 'p7', patientName: '孙桂芳', reason: '术后 24 小时常规回访', createdAt: BASE_NOW - 30 * 60000, done: false },
-      { id: uid('f'), patientId: 'p7', patientName: '孙桂芳', reason: '异常回访：复苏滞留（恶心呕吐）', createdAt: BASE_NOW - 30 * 60000, done: false },
-    ],
+    state: initial.state,
+    currentUser: sessionUser,
+    clockOffsetMin: initial.clockOffsetMin,
+    toasts: [],
+    activePatientId: initial.state.patients[0].id,
+    lastReportCommandByPatient: {},
 
-    login: (account, password) => {
-      const acc = ACCOUNTS.find((a) => a.account === account)
-      if (!acc || acc.password !== password) return '账号或密码错误'
-      set({ user: { account: acc.account, name: acc.name, role: acc.role, title: acc.title, patientId: acc.patientId } })
-      return null
+    now: () => new Date(Date.now() + get().clockOffsetMin * 60_000),
+
+    login: (loginName, password) => {
+      const u = SEED_USERS.find((x) => x.login === loginName && x.password === password);
+      if (!u) return false;
+      set({ currentUser: u, activePatientId: u.patientId ?? get().state.patients[0].id });
+      try { localStorage.setItem(SESSION_KEY, u.id); } catch { /* ignore */ }
+      return true;
     },
-    logout: () => set({ user: null }),
-    tick: (minutes) => set((s) => ({ now: s.now + minutes * 60000 })),
-
-    checkIn: (id) =>
-      update(id, (p) => {
-        const maxQ = Math.max(0, ...get().patients.map((x) => x.queueNo))
-        const next = { ...p, queueNo: maxQ + 1, checkedInAt: get().now }
-        return transit(next, 'registered', get().now, actor(), '患者到院签到')
-      }),
-
-    saveAssessment: (id, a) =>
-      update(id, (p) => {
-        const now = get().now
-        const assessment: PreopAssessment = { ...a, by: actor(), at: now }
-        const summary = `术前评估完成：BP ${a.sbp}/${a.dbp}，HR ${a.hr}，SpO2 ${a.spo2}%，体温 ${a.temp}℃，皮试${a.skinTest}` +
-          `${a.consentSigned ? '，同意书已签' : '，同意书未签'}${a.belongingsSealed ? `，物品已封存（${a.bagNo}）` : ''}` +
-          `${a.greenChannel ? '，绿色通道' : ''}${a.skinTest === '阳性' ? '，皮试阳性已通知医生' : ''}`
-        const withA = {
-          ...p,
-          assessment,
-          timeline: [...p.timeline, makeEvent(now, actor(), 'action', summary, '术前评估已完成，请耐心候诊。')],
-        }
-        // 评估完成后自动进入候诊区（参与候诊排序）
-        return p.status === 'registered' ? transit(withA, 'waiting', now, actor(), '进入候诊区等待手术') : withA
-      }),
-
-    confirmHandover: (id, h) => {
-      const p = get().patients.find((x) => x.id === id)
-      if (!p) return '患者不存在'
-      if (p.status !== 'waiting') return '当前状态无需交接确认'
-      if (p.handover) return '交接已确认，请勿重复操作'
-      update(id, (x) => ({
-        ...x,
-        handover: { ...h, confirmedAt: get().now },
-        timeline: [
-          ...x.timeline,
-          makeEvent(
-            get().now,
-            actor(),
-            'action',
-            `陪诊人确认交接：交接时间 ${new Date(get().now).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}，物品袋 ${h.bagNo}，术后联系电话 ${h.contactPhone}`,
-            '陪诊人已确认交接信息（物品袋编号 / 术后联系号码）。',
-          ),
-        ],
-      }))
-      return null
+    logout: () => {
+      set({ currentUser: null });
+      try { localStorage.removeItem(SESSION_KEY); } catch { /* ignore */ }
     },
+    setActivePatient: (id) => set({ activePatientId: id }),
 
-    advance: (id) => {
-      const s = get()
-      const p = s.patients.find((x) => x.id === id)
-      if (!p) return '患者不存在'
-      const now = s.now
-      switch (p.status) {
-        case 'booked':
-          return '请先在候诊看板执行到院签到'
-        case 'registered':
-          return '请先完成术前评估'
-        case 'waiting': {
-          if (!p.assessment) return '术前评估未完成'
-          if (!p.assessment.consentSigned) return '知情同意书未签署，无法入室'
-          const undone = p.exams.filter((e) => !e.done)
-          if (undone.length) return `术前检查未完成：${undone.map((e) => e.name).join('、')}`
-          if (!feeSettled(p) && !p.assessment.greenChannel) return '费用未结清（绿色通道患者可先诊疗后付费）'
-          if (!p.handover) return '陪诊人尚未确认交接（物品袋编号 / 术后联系号码）'
-          update(id, (x) => transit(x, 'in_or', now, actor(), '患者送入手术间'))
-          return null
+    aggregates: () => {
+      const { state } = get();
+      return state.patients.map((p) => ({ patientId: p.id, patient: project(state, p.id) }));
+    },
+    aggregate: (id) => project(get().state, id),
+
+    pushToast: (kind, text) => {
+      const t = { id: uid('toast'), kind, text };
+      set((s) => ({ toasts: [...s.toasts, t] }));
+      setTimeout(() => get().dismissToast(t.id), 6000);
+    },
+    dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((x) => x.id !== id) })),
+
+    run: (fn, okMsg) => {
+      try {
+        const r = fn();
+        get().persist();
+        if (okMsg) get().pushToast('ok', okMsg);
+        return r;
+      } catch (e) {
+        if (e instanceof DomainError) {
+          get().pushToast('error', `[${e.code}] ${e.message}`);
+        } else {
+          get().pushToast('error', (e as Error).message);
         }
-        case 'in_or':
-          update(id, (x) => transit(x, 'in_surgery', now, actor(), '麻醉完成，手术开始'))
-          return null
-        case 'in_surgery':
-          update(id, (x) => ({
-            ...transit(x, 'recovery', now, actor(), '手术结束，转入复苏室观察'),
-            recovery: { enteredAt: now },
-          }))
-          return null
-        case 'recovery': {
-          if (!p.discharge) return '请先完成离院前评估（疼痛评分 / 饮水进食 / 排尿 / 用药说明 / 复诊时间）'
-          if (isProlonged(p, now) && !p.recovery?.prolongedReason) return '复苏滞留超过 60 分钟，请先登记滞留原因'
-          update(id, (x) => transit(x, 'ready_pickup', now, actor(), '离院评估完成，转入待接走'))
-          return null
-        }
-        case 'ready_pickup': {
-          if (!p.pickupSign) return '接送人尚未签收'
-          if (!feeSettled(p)) return '费用未结清，无法办理离院'
-          const tasks = buildFollowups(p, now)
-          update(id, (x) => transit(x, 'discharged', now, actor(), '接送人签收，患者离院'), tasks)
-          return null
-        }
-        case 'discharged':
-          return '患者已离院'
+        return undefined;
       }
     },
-
-    markBpAbnormal: (id, detail) =>
-      update(id, (p) => ({
-        ...p,
-        exceptions: [...p.exceptions, { id: uid(), type: 'bp_abnormal', at: get().now, by: actor(), detail, resolved: false }],
-        timeline: [...p.timeline, makeEvent(get().now, actor(), 'exception', `血压异常：${detail}`, EX_META.bp_abnormal.publicText)],
-      })),
-
-    delaySurgery: (id, minutes, reason) =>
-      update(id, (p) => ({
-        ...p,
-        delayedMin: p.delayedMin + minutes,
-        exceptions: [...p.exceptions, { id: uid(), type: 'delay', at: get().now, by: actor(), detail: `${reason}，预计延迟 ${minutes} 分钟`, resolved: false }],
-        timeline: [...p.timeline, makeEvent(get().now, actor(), 'exception', `手术延迟：${reason}，预计延迟 ${minutes} 分钟`, EX_META.delay.publicText)],
-      })),
-
-    changeAnesthesia: (id, next, reason) =>
-      update(id, (p) => ({
-        ...p,
-        anesthesia: next,
-        exceptions: [...p.exceptions, { id: uid(), type: 'anesthesia_change', at: get().now, by: actor(), detail: `${p.anesthesia} → ${next}（${reason}）`, resolved: false }],
-        timeline: [
-          ...p.timeline,
-          makeEvent(get().now, actor(), 'exception', `麻醉方式改变：${p.anesthesia} → ${next}（${reason}）`, EX_META.anesthesia_change.publicText),
-        ],
-      })),
-
-    escortLeave: (id) =>
-      update(id, (p) => ({
-        ...p,
-        exceptions: [...p.exceptions, { id: uid(), type: 'escort_leave', at: get().now, by: actor(), detail: `陪诊人 ${p.escort.name} 登记暂时离院`, resolved: false }],
-        timeline: [...p.timeline, makeEvent(get().now, actor(), 'exception', `陪诊人 ${p.escort.name} 登记暂时离院`, EX_META.escort_leave.publicText)],
-      })),
-
-    changePickup: (id, person) =>
-      update(id, (p) => ({
-        ...p,
-        pickup: person,
-        exceptions: [...p.exceptions, { id: uid(), type: 'pickup_change', at: get().now, by: actor(), detail: `接送人更换为 ${person.name}（${person.relation}，${person.phone}）`, resolved: false }],
-        timeline: [...p.timeline, makeEvent(get().now, actor(), 'exception', `接送人更换为 ${person.name}（${person.relation}）`, EX_META.pickup_change.publicText)],
-      })),
-
-    resolveException: (id, exId) =>
-      update(id, (p) => ({
-        ...p,
-        exceptions: p.exceptions.map((e) => (e.id === exId ? { ...e, resolved: true, resolvedAt: get().now } : e)),
-        timeline: [...p.timeline, makeEvent(get().now, actor(), 'note', `异常事件已处理：${EX_META[p.exceptions.find((e) => e.id === exId)?.type ?? 'delay'].label}`)],
-      })),
-
-    settlePayment: (id, amount) =>
-      update(id, (p) => {
-        const paid = Math.min(p.payment.total, p.payment.paid + amount)
-        const settled = paid >= p.payment.total
-        return {
-          ...p,
-          payment: { ...p.payment, paid },
-          exceptions: p.exceptions.map((e) =>
-            e.type === 'fee_unpaid' && settled ? { ...e, resolved: true, resolvedAt: get().now } : e,
-          ),
-          timeline: [
-            ...p.timeline,
-            makeEvent(
-              get().now,
-              actor(),
-              'action',
-              `收费窗口收款 ${amount} 元，累计 ${paid}/${p.payment.total} 元${settled ? '，费用已结清' : ''}`,
-              settled ? '费用已结清。' : undefined,
-            ),
-          ],
-        }
-      }),
-
-    setProlongedReason: (id, reason, note) =>
-      update(id, (p) => ({
-        ...p,
-        recovery: { ...p.recovery!, prolongedReason: reason, prolongedNote: note, prolongedBy: actor() },
-        timeline: [
-          ...p.timeline,
-          makeEvent(get().now, actor(), 'note', `复苏滞留原因登记：${reason}${note ? `（${note}）` : ''}`, '患者恢复时间略长，医护人员正在密切观察，请耐心等待。'),
-        ],
-      })),
-
-    saveDischarge: (id, d) => {
-      const p = get().patients.find((x) => x.id === id)
-      if (!p) return '患者不存在'
-      if (p.status !== 'recovery') return '仅复苏观察中的患者可录入离院评估'
-      if (isProlonged(p, get().now) && !p.recovery?.prolongedReason) return '复苏滞留超过 60 分钟，请先在复苏室登记滞留原因'
-      update(id, (x) => {
-        const now = get().now
-        const withD = {
-          ...x,
-          discharge: { ...d, by: actor(), at: now },
-          timeline: [
-            ...x.timeline,
-            makeEvent(
-              now,
-              actor(),
-              'action',
-              `离院评估完成：疼痛 ${d.painScore} 分，${d.oralIntake ? '可饮水进食' : '暂未饮水进食'}，${d.urination ? '已排尿' : '未排尿'}，用药说明已交代，复诊 ${d.followupAt}`,
-              '离院评估已完成，等待接送人签收。',
-            ),
-          ],
-        }
-        return transit(withD, 'ready_pickup', now, actor(), '离院评估完成，转入待接走')
-      })
-      return null
+    persist: () => persistNow(get().state, get().clockOffsetMin),
+    resetDemo: () => {
+      const fresh = buildSeedState(new Date(Date.now() + get().clockOffsetMin * 60_000));
+      set({ state: fresh });
+      persistNow(fresh, get().clockOffsetMin);
+      get().pushToast('info', '演示数据已重置为初始状态');
     },
 
-    signPickup: (id, signer, phone) => {
-      const p = get().patients.find((x) => x.id === id)
-      if (!p) return '患者不存在'
-      if (p.status !== 'ready_pickup') return '当前状态不可签收'
-      if (!feeSettled(p)) return '费用未结清，请通知家属至收费窗口结清后再签收'
-      const now = get().now
-      const tasks = buildFollowups(p, now)
-      update(id, (x) => {
-        const signed = {
-          ...x,
-          pickupSign: { signer, phone, at: now },
-          timeline: [...x.timeline, makeEvent(now, actor(), 'action', `接送人 ${signer}（${phone}）签收`, '接送人已签收。')],
-        }
-        return transit(signed, 'discharged', now, actor(), '接送人签收，患者离院')
-      }, tasks)
-      return null
+    setClockOffset: (min) => {
+      set({ clockOffsetMin: min });
+      try { localStorage.setItem(CLOCK_KEY, String(min)); } catch { /* ignore */ }
+    },
+    advanceClock: (min) => {
+      set((s) => ({ clockOffsetMin: s.clockOffsetMin + min }));
+      try { localStorage.setItem(CLOCK_KEY, String(get().clockOffsetMin)); } catch { /* ignore */ }
+      get().doTickSla();
+    },
+    setChannelDown: (down) => {
+      set((s) => ({ state: { ...s.state, notifyChannelDown: down } }));
+      get().persist();
+      get().pushToast(down ? 'info' : 'ok', down ? '异步通知通道已置为故障（新通知将失败进入 outbox）' : '异步通知通道已恢复');
     },
 
-    completeFollowup: (fid) =>
-      set((s) => ({ followups: s.followups.map((f) => (f.id === fid ? { ...f, done: true } : f)) })),
-  }
-})
+    doSubmitReport: (patientId, input) => {
+      const user = get().currentUser!;
+      const commandId = uid('cmd');
+      const r = get().run(() => submitReport(
+        get().state, patientId, { id: user.id, role: user.role },
+        input, get().now().toISOString(),
+        { commandId, expectedVersion: get().aggregate(patientId).version },
+      ));
+      if (r) {
+        set((s) => ({ lastReportCommandByPatient: { ...s.lastReportCommandByPatient, [patientId]: commandId } }));
+        const parts: string[] = [];
+        if (r.duplicate) parts.push('命中 2 小时判重窗口：已标记为重复上报，未重复建任务/排队');
+        if (r.escalationTaskId) parts.push('触发高风险规则：普通自动随访已冻结，升级任务已创建');
+        if (r.queued.length) parts.push(`转人工队列 ${r.queued.length} 项：${r.queued.map((q) => q.reason).join('；')}`);
+        if (parts.length === 0) parts.push('上报已受理（低风险，随常规随访处理）');
+        get().pushToast(r.duplicate ? 'info' : 'ok', parts.join('\n'));
+      }
+      return r;
+    },
+    doDeclineContact: (patientId, reason) => {
+      const user = get().currentUser!;
+      get().run(() => declineContact(
+        get().state, patientId, { id: user.id, role: user.role }, reason, get().now().toISOString(),
+        { commandId: uid('cmd'), expectedVersion: get().aggregate(patientId).version },
+      ), '已记录“拒绝联系”，并转入人工队列');
+    },
+    doNurseScreen: (patientId, taskId, decision, expectedVersion) => {
+      const user = get().currentUser!;
+      get().run(() => nurseScreen(
+        get().state, patientId, taskId, { id: user.id, role: user.role }, decision,
+        get().now().toISOString(),
+        { commandId: uid('cmd'), expectedVersion },
+      ), decision.kind === 'referral_request' ? '初筛完成：转诊申请已提交（唯一性已校验）' : `初筛完成：${decision.kind === 'er_advice' ? '急诊建议已发出' : '电话回访已记录'}`);
+    },
+    doResolveReferral: (patientId, referralId, action, note) => {
+      const user = get().currentUser!;
+      get().run(() => resolveReferral(
+        get().state, patientId, referralId, { id: user.id, role: user.role }, action, note,
+        get().now().toISOString(),
+        { commandId: uid('cmd'), expectedVersion: get().aggregate(patientId).version },
+      ), action === 'confirmed' ? '转诊已确认' : '转诊已驳回');
+    },
+    doAddOrder: (patientId, input) => {
+      const user = get().currentUser!;
+      const r = get().run(() => doctorAddOrder(
+        get().state, patientId, { id: user.id, role: user.role }, input,
+        get().now().toISOString(),
+        { commandId: uid('cmd'), expectedVersion: get().aggregate(patientId).version },
+      ));
+      if (r) {
+        const parts: string[] = [`医嘱已追加（事件 #${r.events[0]?.version}）`];
+        if (r.backdated) parts.push('该医嘱为补录（业务时间早于护士记录），时间线按业务时间展示并明确标注');
+        if (r.conflicts.length) parts.push(`检测到与 ${r.conflicts.length} 个既有随访任务冲突，旧任务已取消并建立替代关系`);
+        if (r.interactions.length) parts.push(`用药相互作用 ${r.interactions.length} 项，已通知药师复核`);
+        get().pushToast('ok', parts.join('\n'));
+      }
+      return r;
+    },
+    doWithdrawOrder: (patientId, orderId, reason) => {
+      const user = get().currentUser!;
+      get().run(() => withdrawOrder(
+        get().state, patientId, orderId, { id: user.id, role: user.role }, reason,
+        get().now().toISOString(),
+        { commandId: uid('cmd'), expectedVersion: get().aggregate(patientId).version },
+      ), '医嘱已撤回：原始记录保留为“已撤回”，受影响计划以恢复性任务替代');
+    },
+    doPharmacyAdvice: (patientId, input) => {
+      const user = get().currentUser!;
+      get().run(() => pharmacistAdvice(
+        get().state, patientId, { id: user.id, role: user.role }, input,
+        get().now().toISOString(),
+        { commandId: uid('cmd'), expectedVersion: get().aggregate(patientId).version },
+      ), '用药复核意见已记录（未修改任何诊疗结论/医嘱）');
+    },
+    doResolveQueue: (patientId, taskId, note) => {
+      const user = get().currentUser!;
+      get().run(() => resolveManualQueue(
+        get().state, patientId, taskId, { id: user.id, role: user.role }, note,
+        get().now().toISOString(),
+        { commandId: uid('cmd'), expectedVersion: get().aggregate(patientId).version },
+      ), '人工队列任务已处置关闭');
+    },
+    doClose: (patientId, taskId, basis, expectedVersion) => {
+      const user = get().currentUser!;
+      get().run(() => closeCase(
+        get().state, patientId, taskId, { id: user.id, role: user.role }, basis,
+        get().now().toISOString(),
+        { commandId: uid('cmd'), expectedVersion },
+      ), '事件已闭环关闭（关闭依据已入时间线）');
+    },
+    doRetryNotification: (eventId) => {
+      get().run(() => retryNotification(get().state, eventId, get().now().toISOString()), '通知已重新投递');
+    },
+    doTickSla: () => {
+      const evts = tickSla(get().state, get().now().toISOString());
+      if (evts.length) {
+        get().persist();
+        get().pushToast('error', `SLA 扫描：${evts.length / 2} 个任务仍超时未闭环，已生成持续提醒`);
+      }
+      return evts.length;
+    },
+    doReplayLastReport: (patientId) => {
+      const cmd = get().lastReportCommandByPatient[patientId];
+      if (!cmd) {
+        get().pushToast('info', '本会话该患者尚无已成功的上报命令可重放（请先在患者页面提交一次）');
+        return;
+      }
+      // 重放必须以患者本人身份（命令的原始提交者）
+      const patientUser = get().state.users.find((u) => u.role === 'patient' && u.patientId === patientId)!;
+      const before = get().state.events.length;
+      const r = submitReport(
+        get().state, patientId, { id: patientUser.id, role: 'patient' },
+        { channel: 'mini_app', symptoms: ['发热'], adherence: 'unknown', imageIds: [], imagesReadable: true },
+        get().now().toISOString(),
+        { commandId: cmd },
+      );
+      const noop = r.events.length === 0 && get().state.events.length === before;
+      get().pushToast(noop ? 'info' : 'error', noop
+        ? '幂等生效：同一命令令牌重放被整体丢弃，未产生任何新事件/新任务/新通知'
+        : '异常：重放产生了副作用');
+    },
+  };
+});
+
+export const ROLE_LABEL: Record<Role, string> = {
+  patient: '患者（受限入口）',
+  nurse: '随访护士',
+  doctor: '主治医生',
+  pharmacist: '临床药师',
+};

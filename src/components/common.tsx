@@ -1,96 +1,121 @@
-import type { ReactNode } from 'react'
-import type { Patient } from '../types'
-import { EX_META, STATUS_META, feeSettled, fmtTime } from '../utils'
+import React from 'react';
+import type { PatientAggregate, FollowUpTask, Report } from '../types';
+import { useStore } from '../store';
+import { fmt, maskPatient, RISK_LABEL, CHANNEL_LABEL } from '../rules';
+import type { Role } from '../types';
 
-export function StatusBadge({ status }: { status: Patient['status'] }) {
-  const m = STATUS_META[status]
+export const Card: React.FC<React.PropsWithChildren<{ title?: React.ReactNode; extra?: React.ReactNode; className?: string }>> = ({ title, extra, children, className = '' }) => (
+  <div className={`card ${className}`}>
+    {(title || extra) && (
+      <h3>
+        <span style={{ flex: 1 }}>{title}</span>
+        {extra}
+      </h3>
+    )}
+    {children}
+  </div>
+);
+
+export const Badge: React.FC<React.PropsWithChildren<{ tone: 'red' | 'amber' | 'green' | 'blue' | 'purple' | 'gray'; outline?: boolean }>> = ({ tone, outline, children }) => (
+  <span className={`badge ${tone}${outline ? ' outline' : ''}`}>{children}</span>
+);
+
+export const TASK_STATUS_META: Record<string, { label: string; tone: 'red' | 'amber' | 'green' | 'blue' | 'purple' | 'gray' }> = {
+  scheduled: { label: '已排期', tone: 'blue' },
+  frozen: { label: '已冻结', tone: 'purple' },
+  open: { label: '待处理', tone: 'red' },
+  in_progress: { label: '处理中', tone: 'amber' },
+  done: { label: '已完成', tone: 'green' },
+  cancelled: { label: '已取消', tone: 'gray' },
+};
+
+export const TaskBadge: React.FC<{ status: string }> = ({ status }) => {
+  const m = TASK_STATUS_META[status] ?? { label: status, tone: 'gray' as const };
+  return <Badge tone={m.tone}>{m.label}</Badge>;
+};
+
+export const riskTone = (r: Report['risk']): 'red' | 'amber' | 'green' =>
+  r === 'high' ? 'red' : r === 'medium' ? 'amber' : 'green';
+
+export const isOverdue = (t: FollowUpTask, now: Date): boolean =>
+  (t.status === 'open' || t.status === 'in_progress') && +new Date(t.dueAt) < +now;
+
+/** 患者信息横幅：按角色脱敏 */
+export const PatientBanner: React.FC<{ agg: PatientAggregate; role: Role; self?: boolean }> = ({ agg, role, self }) => {
+  const m = maskPatient(agg.patient, role, self);
+  const consentExpired = +new Date(useStore.getState().now()) > +new Date(agg.patient.consent.validUntil);
   return (
-    <span className="badge" style={{ background: `${m.color}1a`, color: m.color, borderColor: `${m.color}66` }}>
-      {m.label}
-    </span>
-  )
-}
+    <Card
+      title={
+        <>
+          {m.name}
+          <Badge tone="blue">{agg.patient.surgeryType}</Badge>
+          {agg.patient.consent.declinedContact && <Badge tone="amber">已拒绝联系</Badge>}
+          {consentExpired && <Badge tone="red">授权已过期</Badge>}
+        </>
+      }
+      extra={<span className="muted small">聚合版本 v{agg.version}</span>}
+    >
+      <div className="kv-grid">
+        <div className="kv"><div className="k">性别 / 年龄</div><div className="v">{m.gender} / {m.age}{role === 'pharmacist' && <span className="masked-tag">部分脱敏</span>}</div></div>
+        <div className="kv"><div className="k">联系电话</div><div className="v">{m.phone}{!['patient', 'nurse', 'doctor'].includes(role) && <span className="masked-tag">无权查看</span>}</div></div>
+        <div className="kv"><div className="k">证件后四位</div><div className="v">{m.idCardLast4}{role === 'pharmacist' && <span className="masked-tag">无权查看</span>}</div></div>
+        <div className="kv"><div className="k">出院日期</div><div className="v">{fmt(agg.patient.dischargeDate)}</div></div>
+        <div className="kv"><div className="k">过敏史</div><div className="v">{m.allergiesText}</div></div>
+        <div className="kv"><div className="k">用药计划</div><div className="v">{m.medPlanNames.join('、')}</div></div>
+      </div>
+      <div className="divider" />
+      <div className="kv">
+        <div className="k">出院医嘱{role === 'pharmacist' && <span className="masked-tag">药师无权查看完整诊疗医嘱</span>}</div>
+        <div className="v">{m.dischargeOrders.map((o, i) => <div key={i}>· {o}</div>)}</div>
+      </div>
+    </Card>
+  );
+};
 
-export function FeeBadge({ p }: { p: Patient }) {
-  if (feeSettled(p)) return <span className="badge badge-green">已结清</span>
-  if (p.payment.paid > 0) return <span className="badge badge-amber">部分缴费</span>
-  return <span className="badge badge-red">未缴费</span>
-}
-
-export function FlagBadges({ p }: { p: Patient }) {
-  const open = p.exceptions.filter((e) => !e.resolved)
-  return (
-    <span className="flags">
-      {p.assessment?.greenChannel && <span className="badge badge-green">绿色通道</span>}
-      {p.delayedMin > 0 && <span className="badge badge-amber">延迟{p.delayedMin}分钟</span>}
-      {open.map((e) => (
-        <span key={e.id} className="badge badge-red" title={e.detail}>
-          {EX_META[e.type].label}
-        </span>
-      ))}
-    </span>
-  )
-}
-
-export function Card({ title, extra, children }: { title: string; extra?: ReactNode; children: ReactNode }) {
-  return (
-    <section className="card">
-      <header className="card-head">
-        <h3>{title}</h3>
-        <div>{extra}</div>
-      </header>
-      <div className="card-body">{children}</div>
-    </section>
-  )
-}
-
-export function Msg({ msg }: { msg: string | null }) {
-  if (!msg) return null
-  return <div className="msg">{msg}</div>
-}
-
-export function Timeline({ p, publicOnly }: { p: Patient; publicOnly?: boolean }) {
-  const events = (publicOnly ? p.timeline.filter((e) => e.publicText) : p.timeline)
-    .slice()
-    .sort((a, b) => b.at - a.at)
-  return (
-    <ul className="timeline">
-      {events.map((e) => (
-        <li key={e.id} className={`tl-${e.kind}`}>
-          <span className="tl-time">{fmtTime(e.at)}</span>
-          <span className="tl-text">{publicOnly ? e.publicText : e.text}</span>
-          {!publicOnly && <span className="tl-actor">{e.actor}</span>}
-        </li>
-      ))}
-    </ul>
-  )
-}
-
-export function ExceptionList({ p, onResolve }: { p: Patient; onResolve?: (exId: string) => void }) {
-  if (!p.exceptions.length) return <div className="muted">暂无异常事件</div>
-  return (
-    <ul className="ex-list">
-      {p.exceptions
-        .slice()
-        .sort((a, b) => b.at - a.at)
-        .map((e) => (
-          <li key={e.id} className={e.resolved ? 'ex resolved' : 'ex'}>
-            <span className={`badge ${e.resolved ? 'badge-gray' : 'badge-red'}`}>{EX_META[e.type].label}</span>
-            <span className="ex-detail">{e.detail}</span>
-            <span className="muted">
-              {fmtTime(e.at)} · {e.by}
-            </span>
-            {e.resolved ? (
-              <span className="muted">已处理 {fmtTime(e.resolvedAt)}</span>
-            ) : (
-              onResolve && (
-                <button className="btn btn-xs" onClick={() => onResolve(e.id)}>
-                  标记处理
-                </button>
-              )
-            )}
-          </li>
+export const ReportCard: React.FC<{ report: Report; showSensitive: boolean }> = ({ report, showSensitive }) => (
+  <div className={`report-box ${report.risk === 'high' ? 'high' : report.risk === 'medium' ? 'medium' : ''}`}>
+    <div className="rtop">
+      <b>{fmt(report.occurredAt)}</b>
+      <Badge tone={riskTone(report.risk)}>{RISK_LABEL[report.risk]}</Badge>
+      <span className="muted">{CHANNEL_LABEL[report.channel]}上报</span>
+      {report.duplicateOf && <Badge tone="purple" outline>重复上报（已判重）</Badge>}
+      {report.escalationId && (report.handled ? <Badge tone="green">已随升级闭环</Badge> : <Badge tone="red">挂接升级中</Badge>)}
+    </div>
+    <div className="small" style={{ marginTop: 5 }}>
+      症状：{report.symptoms.length ? report.symptoms.join('、') : '无'}
+      {showSensitive && <>
+        {' · '}体温：{report.temperature ? `${report.temperature}℃` : '—'}
+        {' · '}血压：{report.systolic ? `${report.systolic}/${report.diastolic} mmHg` : '—'}
+      </>}
+      {' · '}用药依从：{{ full: '完全依从', partial: '部分依从', none: '未依从', unknown: '未报告' }[report.adherence]}
+    </div>
+    {showSensitive && report.imageIds.length > 0 && (
+      <div>
+        {report.imageIds.map((img) => (
+          <span key={img} className={`image-chip ${report.imageReadable ? '' : 'broken'}`}>
+            {report.imageReadable ? '🖼' : '⚠️'} {img}{report.imageReadable ? '' : '（无法读取）'}
+          </span>
         ))}
-    </ul>
-  )
-}
+      </div>
+    )}
+    {showSensitive && report.note && <div className="small muted" style={{ marginTop: 4 }}>备注：{report.note}</div>}
+    <div className="rules">命中规则：{report.triggeredRules.join('；')}</div>
+    {!showSensitive && <div className="small" style={{ color: 'var(--purple)', marginTop: 3 }}>※ 当前角色按授权不可见体温/血压/图片字段</div>}
+  </div>
+);
+
+export const Toasts: React.FC = () => {
+  const toasts = useStore((s) => s.toasts);
+  const dismiss = useStore((s) => s.dismissToast);
+  return (
+    <div className="toast-stack">
+      {toasts.map((t) => (
+        <div key={t.id} className={`toast ${t.kind}`}>
+          <span className="x" onClick={() => dismiss(t.id)}>✕</span>
+          {t.text}
+        </div>
+      ))}
+    </div>
+  );
+};

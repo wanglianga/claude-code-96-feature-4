@@ -1,14 +1,15 @@
 {
-  "name": "day-surgery-handover",
+  "name": "post-discharge-followup",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "医院日间手术患者陪诊交接与术后接送平台",
+  "description": "患者出院后分级随访与高风险升级平台（事件溯源 / 角色授权脱敏 / 幂等并发安全）",
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "verify": "esbuild verify/engine-check.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/engine-check.mjs && node node_modules/.cache/engine-check.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -19,6 +20,7 @@
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
+    "esbuild": "^0.21.5",
     "typescript": "^5.5.4",
     "vite": "^5.4.8"
   }
